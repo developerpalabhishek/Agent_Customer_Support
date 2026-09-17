@@ -1,0 +1,145 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Voice Assistant</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 60px auto; text-align: center; }
+    button { font-size: 18px; padding: 12px 28px; border-radius: 8px; border: 1px solid #ccc; cursor: pointer; }
+    button.recording { background: #d33; color: white; border-color: #d33; }
+    #status { margin-top: 16px; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Voice Assistant</h1>
+  <button id="toggle">Start Talking</button>
+  <div id="status">idle</div>
+
+  <script>
+    const INPUT_SR = 16000;
+    const OUTPUT_SR = 24000;
+
+    let ws = null;
+    let audioCtx = null;      // mic capture context (native device rate)
+    let playbackCtx = null;   // fixed-rate context for assistant audio
+    let processor = null;
+    let micStream = null;
+    let nextPlayTime = 0;
+    let recording = false;
+
+    const btn = document.getElementById("toggle");
+    const statusEl = document.getElementById("status");
+
+    function setStatus(s) { statusEl.textContent = s; }
+
+    function floatTo16BitPCM(float32) {
+      const out = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return out;
+    }
+
+    function downsample(buffer, inRate, outRate) {
+      if (outRate === inRate) return buffer;
+      const ratio = inRate / outRate;
+      const newLen = Math.round(buffer.length / ratio);
+      const result = new Float32Array(newLen);
+      for (let i = 0; i < newLen; i++) {
+        result[i] = buffer[Math.floor(i * ratio)];
+      }
+      return result;
+    }
+
+    function base64FromInt16(int16) {
+      const bytes = new Uint8Array(int16.buffer);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    }
+
+    function int16FromBase64(b64) {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new Int16Array(bytes.buffer);
+    }
+
+    function playPCM(int16) {
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x8000;
+
+      const buffer = playbackCtx.createBuffer(1, float32.length, OUTPUT_SR);
+      buffer.copyToChannel(float32, 0);
+
+      const source = playbackCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(playbackCtx.destination);
+
+      const now = playbackCtx.currentTime;
+      if (nextPlayTime < now) nextPlayTime = now;
+      source.start(nextPlayTime);
+      nextPlayTime += buffer.duration;
+    }
+
+    function stopPlayback() {
+      nextPlayTime = playbackCtx ? playbackCtx.currentTime : 0;
+    }
+
+    async function start() {
+      ws = new WebSocket(`ws://${location.host}/voice`);
+
+      ws.onopen = async () => {
+        setStatus("connected — listening");
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx = new AudioContext();
+        playbackCtx = new AudioContext();
+
+        const source = audioCtx.createMediaStreamSource(micStream);
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+          if (ws.readyState !== WebSocket.OPEN) return;
+          const input = e.inputBuffer.getChannelData(0);
+          const down = downsample(input, audioCtx.sampleRate, INPUT_SR);
+          const pcm16 = floatTo16BitPCM(down);
+          ws.send(JSON.stringify({ audio: base64FromInt16(pcm16) }));
+        };
+
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+      };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.error) {
+          setStatus("error: " + msg.error);
+        } else if (msg.interrupted) {
+          stopPlayback();
+        } else if (msg.audio) {
+          playPCM(int16FromBase64(msg.audio));
+        }
+      };
+
+      ws.onclose = () => setStatus("disconnected");
+      ws.onerror = () => setStatus("websocket error");
+    }
+
+    function stop() {
+      if (processor) { processor.disconnect(); processor = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      if (ws) { ws.close(); ws = null; }
+      setStatus("idle");
+    }
+
+    btn.onclick = () => {
+      recording = !recording;
+      btn.classList.toggle("recording", recording);
+      btn.textContent = recording ? "Stop" : "Start Talking";
+      if (recording) start(); else stop();
+    };
+  </script>
+</body>
+</html>
